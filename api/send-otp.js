@@ -1,22 +1,15 @@
-// api/send-otp.js - FIXED NODEMAILER IMPORT
-const nodemailer = require("nodemailer"); // Use require instead of import
+const { SESClient, SendEmailCommand } = require("@aws-sdk/client-ses");
 
 module.exports = async function handler(req, res) {
-  // Enable CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Accept, Authorization",
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization");
   res.setHeader("Cache-Control", "no-cache");
 
-  // Handle preflight requests
   if (req.method === "OPTIONS") {
     return res.status(200).json({ message: "CORS preflight successful" });
   }
 
-  // Only allow POST requests
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
@@ -28,14 +21,12 @@ module.exports = async function handler(req, res) {
   try {
     console.log("📧 Starting OTP email process...");
     console.log("🔐 Environment check:", {
-      hasGmailUser: !!process.env.GMAIL_USER,
-      hasGmailPass: !!process.env.GMAIL_PASS,
-      gmailUser: process.env.GMAIL_USER
-        ? process.env.GMAIL_USER.substring(0, 5) + "***"
-        : "missing",
+      hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
+      hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
+      region: process.env.AWS_REGION || "missing",
+      fromEmail: process.env.SES_FROM_EMAIL || "missing",
     });
 
-    // Extract and validate request data
     const {
       to_email,
       otp,
@@ -50,9 +41,7 @@ module.exports = async function handler(req, res) {
       app_name,
     });
 
-    // Validate required fields
     if (!to_email || !otp) {
-      console.log("❌ Missing required fields");
       return res.status(400).json({
         success: false,
         message: "Email and OTP are required fields",
@@ -60,91 +49,41 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(to_email)) {
-      console.log("❌ Invalid email format:", to_email);
-      return res.status(400).json({
-        success: false,
-        message: "Invalid email format",
-      });
+      return res.status(400).json({ success: false, message: "Invalid email format" });
     }
 
-    // Validate OTP format (6 digits)
     if (!/^\d{6}$/.test(otp)) {
-      console.log("❌ Invalid OTP format:", otp);
-      return res.status(400).json({
-        success: false,
-        message: "OTP must be exactly 6 digits",
-      });
+      return res.status(400).json({ success: false, message: "OTP must be exactly 6 digits" });
     }
 
-    // Check environment variables
-    if (!process.env.GMAIL_USER || !process.env.GMAIL_PASS) {
-      console.error("❌ Missing Gmail credentials in environment variables");
+    if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY || !process.env.SES_FROM_EMAIL) {
+      console.error("❌ Missing AWS credentials in environment variables");
       return res.status(500).json({
         success: false,
-        message: "Server configuration error - missing credentials",
+        message: "Server configuration error - missing AWS credentials",
         debug: {
-          hasGmailUser: !!process.env.GMAIL_USER,
-          hasGmailPass: !!process.env.GMAIL_PASS,
+          hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
+          hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
+          hasFromEmail: !!process.env.SES_FROM_EMAIL,
         },
       });
     }
 
-    console.log("🔧 Creating email transporter...");
-
-    // Create nodemailer transporter - FIXED METHOD
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_PASS,
-      },
-      secure: true,
-      tls: {
-        rejectUnauthorized: false,
+    const sesClient = new SESClient({
+      region: process.env.AWS_REGION || "us-east-1",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       },
     });
 
-    // Verify transporter connection
-    console.log("🔍 Verifying SMTP connection...");
-    try {
-      await transporter.verify();
-      console.log("✅ SMTP connection verified successfully");
-    } catch (verifyError) {
-      console.error("❌ SMTP verification failed:", verifyError.message);
-      console.error("Error code:", verifyError.code);
-
-      let errorMessage = "Email service configuration error";
-      if (verifyError.code === "EAUTH") {
-        errorMessage =
-          "Gmail authentication failed. Please check your app password.";
-      } else if (verifyError.code === "ECONNECTION") {
-        errorMessage = "Failed to connect to Gmail servers.";
-      }
-
-      return res.status(500).json({
-        success: false,
-        message: errorMessage,
-        debug: {
-          errorCode: verifyError.code,
-          errorMessage: verifyError.message,
-          solution:
-            verifyError.code === "EAUTH"
-              ? "Generate new Gmail app password"
-              : "Check network connection",
-        },
-      });
-    }
-
-    // Determine email content based on type
     const isPasswordReset = type === "password_reset";
     const subject = `${app_name} - ${isPasswordReset ? "Password Reset" : "Email Verification"} Code`;
 
     console.log("📝 Preparing email content...");
 
-    // Professional HTML email template
     const htmlContent = `
     <!DOCTYPE html>
     <html lang="en">
@@ -178,46 +117,34 @@ module.exports = async function handler(req, res) {
                 <h1>${app_name}</h1>
                 <p>${isPasswordReset ? "Password Reset" : "Email Verification"}</p>
             </div>
-            
             <div class="content">
                 <h2>${isPasswordReset ? "Reset Your Password" : "Verify Your Email"}</h2>
-                <p>
-                    ${
-                      isPasswordReset
-                        ? "You requested to reset your password. Please use the verification code below:"
-                        : "Welcome to AJ Physics Chat! Please verify your email address with the code below:"
-                    }
-                </p>
-                
+                <p>${isPasswordReset
+                  ? "You requested to reset your password. Please use the verification code below:"
+                  : "Welcome to AJ Physics Chat! Please verify your email address with the code below:"}</p>
                 <div class="otp-container">
                     <div class="otp-box">
                         <div class="otp-code">${otp}</div>
                     </div>
                 </div>
-                
                 <p style="text-align: center; font-weight: 500;">
                     Enter this code in the app to ${isPasswordReset ? "reset your password" : "activate your account"}.
                 </p>
-                
                 <div class="notice">
-                    <h3>🔒 Security Information</h3>
+                    <h3>Security Information</h3>
                     <ul>
                         <li>This code will expire in <strong>5 minutes</strong></li>
                         <li>Never share this code with anyone</li>
                         <li>Only enter this code in the official ${app_name} app</li>
-                        <li>${
-                          isPasswordReset
+                        <li>${isPasswordReset
                             ? "If you didn't request a password reset, please ignore this email"
-                            : "If you didn't create an account, please ignore this email"
-                        }</li>
+                            : "If you didn't create an account, please ignore this email"}</li>
                     </ul>
                 </div>
-                
                 <p style="color: #718096; font-size: 14px; text-align: center; margin-top: 30px;">
                     Need help? Contact our support team for assistance.
                 </p>
             </div>
-            
             <div class="footer">
                 <p>&copy; ${new Date().getFullYear()} ${app_name}. All rights reserved.</p>
                 <p style="font-size: 12px;">This is an automated message. Please do not reply.</p>
@@ -226,39 +153,36 @@ module.exports = async function handler(req, res) {
     </body>
     </html>`;
 
-    // Email options
-    const mailOptions = {
-      from: `"${app_name}" <${process.env.GMAIL_USER}>`,
-      to: to_email,
-      subject: subject,
-      html: htmlContent,
-      text: `${app_name}\n\n${isPasswordReset ? "Password Reset" : "Email Verification"}\n\nYour verification code: ${otp}\n\nThis code expires in 5 minutes.\n\n${isPasswordReset ? "If you didn't request this, ignore this email." : "If you didn't sign up, ignore this email."}\n\n© ${new Date().getFullYear()} ${app_name}`,
-      priority: "high",
-    };
+    const command = new SendEmailCommand({
+      Source: `"${app_name}" <${process.env.SES_FROM_EMAIL}>`,
+      Destination: { ToAddresses: [to_email] },
+      Message: {
+        Subject: { Data: subject, Charset: "UTF-8" },
+        Body: {
+          Html: { Data: htmlContent, Charset: "UTF-8" },
+          Text: {
+            Data: `${app_name}\n\n${isPasswordReset ? "Password Reset" : "Email Verification"}\n\nYour verification code: ${otp}\n\nThis code expires in 5 minutes.\n\n${isPasswordReset ? "If you didn't request this, ignore this email." : "If you didn't sign up, ignore this email."}\n\n© ${new Date().getFullYear()} ${app_name}`,
+            Charset: "UTF-8",
+          },
+        },
+      },
+    });
 
     console.log("📤 Sending email to:", to_email);
+    const result = await sesClient.send(command);
+    console.log("✅ Email sent successfully! MessageId:", result.MessageId);
 
-    // Send the email
-    const info = await transporter.sendMail(mailOptions);
-    console.log("✅ Email sent successfully!");
-    console.log("📮 Message ID:", info.messageId);
-
-    // Success response
     res.status(200).json({
       success: true,
       message: "OTP sent successfully",
       timestamp: new Date().toISOString(),
-      messageId: info.messageId,
-      debug: {
-        to: to_email,
-        subject: subject,
-        service: "Gmail via Nodemailer",
-      },
+      messageId: result.MessageId,
+      debug: { to: to_email, subject, service: "Amazon SES" },
     });
+
   } catch (error) {
     console.error("❌ Fatal error in send-otp function:", error);
 
-    // Detailed error analysis
     let errorMessage = "Failed to send verification code";
     let debugInfo = {
       errorType: error.constructor.name,
@@ -266,24 +190,17 @@ module.exports = async function handler(req, res) {
       timestamp: new Date().toISOString(),
     };
 
-    if (error.code === "EAUTH") {
-      errorMessage =
-        "Gmail authentication failed. Please check your app password.";
-      debugInfo.solution = "Generate a new Gmail app password";
-    } else if (error.code === "ECONNECTION") {
-      errorMessage = "Failed to connect to Gmail servers.";
-      debugInfo.solution = "Check internet connection";
-    } else if (error.code === "EMESSAGE") {
-      errorMessage = "Invalid email message format.";
-    } else if (error.message?.includes("Invalid login")) {
-      errorMessage = "Gmail credentials are invalid.";
-      debugInfo.solution = "Verify Gmail username and app password";
+    if (error.name === "MessageRejected") {
+      errorMessage = "Email rejected by SES. Sender email may not be verified.";
+      debugInfo.solution = "Verify the sender email in AWS SES console";
+    } else if (error.name === "InvalidClientTokenId" || error.name === "InvalidSignatureException") {
+      errorMessage = "Invalid AWS credentials.";
+      debugInfo.solution = "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY";
+    } else if (error.name === "AccessDeniedException") {
+      errorMessage = "AWS access denied. Check IAM permissions.";
+      debugInfo.solution = "Ensure IAM user has AmazonSESFullAccess policy";
     }
 
-    res.status(500).json({
-      success: false,
-      message: errorMessage,
-      debug: debugInfo,
-    });
+    res.status(500).json({ success: false, message: errorMessage, debug: debugInfo });
   }
 };
